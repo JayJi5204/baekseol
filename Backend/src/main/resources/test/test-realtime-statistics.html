@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>실시간 통계</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #ddd;
+        }
+
+        h1 {
+            font-size: 24px;
+            color: #333;
+        }
+
+        .status {
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .status.connected {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .status.connecting {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .config {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+
+        .config label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .config input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            margin-bottom: 10px;
+        }
+
+        .config button {
+            padding: 8px 16px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 8px;
+            font-size: 14px;
+        }
+
+        .config button:hover {
+            background: #0056b3;
+        }
+
+        .config button.danger {
+            background: #dc3545;
+        }
+
+        .config button.danger:hover {
+            background: #c82333;
+        }
+
+        .participant-count {
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+
+        .participant-count h2 {
+            font-size: 20px;
+            color: #333;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+        }
+
+        .stat-card {
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 15px;
+        }
+
+        .stat-card h3 {
+            font-size: 16px;
+            margin-bottom: 15px;
+            color: #333;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 8px;
+        }
+
+        .stat-card ul {
+            list-style: none;
+        }
+
+        .stat-card li {
+            padding: 8px;
+            margin: 5px 0;
+            background: #f8f9fa;
+            border-radius: 4px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .stat-label {
+            font-weight: 500;
+        }
+
+        .stat-count {
+            background: #007bff;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>실시간 참여자 통계</h1>
+        <div id="status" class="status connecting">대기중</div>
+    </div>
+
+    <div class="config">
+        <label>설문 ID:</label>
+        <input type="number" id="surveyIdInput" value="1">
+
+        <label>백엔드 URL:</label>
+        <input type="text" id="backendUrlInput" value="http://localhost:8081">
+
+        <button onclick="connect()">연결</button>
+        <button onclick="disconnect()" class="danger">연결 해제</button>
+    </div>
+
+    <div class="participant-count">
+        <h2 id="participantCount">참여자: - / -명</h2>
+    </div>
+
+    <div class="stats-grid">
+        <div class="stat-card">
+            <h3>성별 분포</h3>
+            <ul id="genderList">
+                <li>데이터 없음</li>
+            </ul>
+        </div>
+
+        <div class="stat-card">
+            <h3>나이대 분포</h3>
+            <ul id="ageList">
+                <li>데이터 없음</li>
+            </ul>
+        </div>
+
+        <div class="stat-card">
+            <h3>직업 분포</h3>
+            <ul id="workList">
+                <li>데이터 없음</li>
+            </ul>
+        </div>
+    </div>
+</div>
+
+<script>
+    let stompClient = null;
+    let surveyId = 1;
+    let backendUrl = 'http://localhost:8081';
+
+    function updateStatus(status) {
+        const statusEl = document.getElementById('status');
+        statusEl.className = `status ${status}`;
+        const text = status === 'connected' ? '연결됨' : status === 'disconnected' ? '연결 끊김' : '연결중';
+        statusEl.textContent = text;
+    }
+
+    function loadInitialData() {
+        fetch(`${backendUrl}/api/v1/surveys/${surveyId}/statistics/participants`)
+            .then(res => res.ok ? res.json() : Promise.reject(res.status))
+            .then(response => updateUI(response.data))
+            .catch(err => console.error('초기 데이터 로드 실패:', err));
+    }
+
+    function connect() {
+        surveyId = document.getElementById('surveyIdInput').value;
+        backendUrl = document.getElementById('backendUrlInput').value;
+
+        if (stompClient && stompClient.connected) {
+            disconnect();
+        }
+
+        updateStatus('connecting');
+        loadInitialData();
+
+        const socket = new SockJS(`${backendUrl}/ws`);
+        stompClient = Stomp.over(socket);
+        stompClient.debug = null;
+
+        stompClient.connect(
+            {},
+            function(frame) {
+                updateStatus('connected');
+
+                stompClient.subscribe(`/topic/survey/${surveyId}/statistics`, function(message) {
+                    const response = JSON.parse(message.body);
+                    const data = response.data || response;
+                    updateUI(data);
+                });
+            },
+            function(error) {
+                updateStatus('disconnected');
+                console.error('연결 실패:', error);
+            }
+        );
+    }
+
+    function disconnect() {
+        if (stompClient && stompClient.connected) {
+            stompClient.disconnect(() => updateStatus('disconnected'));
+        }
+    }
+
+    function updateUI(data) {
+        document.getElementById('participantCount').textContent =
+            `참여자: ${data.responseCnt || 0} / ${data.maxResponse || '∞'}명`;
+
+        const genderLabels = { 'MALE': '남성', 'FEMALE': '여성' };
+        const genderList = document.getElementById('genderList');
+        if (data.genderDistribution?.length > 0) {
+            genderList.innerHTML = data.genderDistribution
+                .filter(item => item.count > 0)
+                .map(item => `
+                    <li>
+                        <span class="stat-label">${genderLabels[item.label] || item.label}</span>
+                        <span class="stat-count">${item.count}명</span>
+                    </li>
+                `).join('');
+        } else {
+            genderList.innerHTML = '<li>데이터 없음</li>';
+        }
+
+        const ageLabels = {
+            'TEEN': '10대', 'TWENTIES': '20대', 'THIRTIES': '30대',
+            'FORTIES': '40대', 'FIFTIES': '50대', 'SIXTY_PLUS': '60대 이상'
+        };
+        const ageList = document.getElementById('ageList');
+        if (data.ageDistribution?.length > 0) {
+            ageList.innerHTML = data.ageDistribution
+                .filter(item => item.count > 0)
+                .map(item => `
+                    <li>
+                        <span class="stat-label">${ageLabels[item.label] || item.label}</span>
+                        <span class="stat-count">${item.count}명</span>
+                    </li>
+                `).join('');
+        } else {
+            ageList.innerHTML = '<li>데이터 없음</li>';
+        }
+
+        const workLabels = {
+            'IT': 'IT/개발', 'OFFICE': '사무/관리직', 'MANUFACTURING': '제조/건설',
+            'SERVICE': '서비스/판매', 'EDUCATION': '교육', 'MEDICAL': '의료',
+            'CREATIVE': '창작/디자인/미디어', 'STUDENT': '학생',
+            'SELF_EMPLOYED': '프리랜서/자영업', 'ETC': '기타'
+        };
+        const workList = document.getElementById('workList');
+        if (data.workDistribution?.length > 0) {
+            workList.innerHTML = data.workDistribution
+                .filter(item => item.count > 0)
+                .map(item => `
+                    <li>
+                        <span class="stat-label">${workLabels[item.label] || item.label}</span>
+                        <span class="stat-count">${item.count}명</span>
+                    </li>
+                `).join('');
+        } else {
+            workList.innerHTML = '<li>데이터 없음</li>';
+        }
+    }
+
+    window.onbeforeunload = () => disconnect();
+</script>
+</body>
+</html>

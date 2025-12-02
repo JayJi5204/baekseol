@@ -1,0 +1,185 @@
+def isMrToDevOpenOrUpdated() {
+  def t   = (env.gitlabActionType ?: '').trim().toLowerCase()
+  def tgt = (env.gitlabTargetBranch ?: '').trim().toLowerCase()
+  def mra = (env.gitlabMergeRequestAction ?: env.gitlabMergeRequestState ?: '').trim().toLowerCase()
+  return (t in ['merge','merge_request']) && (tgt == 'dev') && (mra in ['open','opened','update','updated'])
+}
+
+def isDevDeployTrigger() {
+  def t   = (env.gitlabActionType ?: '').trim().toLowerCase()
+  def src = (env.gitlabSourceBranch ?: env.BRANCH_NAME ?: '').trim().toLowerCase()
+  def tgt = (env.gitlabTargetBranch ?: '').trim().toLowerCase()
+  def mra = (env.gitlabMergeRequestAction ?: env.gitlabMergeRequestState ?: '').trim().toLowerCase()
+  return (t == 'push' && src == 'dev') || ((t in ['merge','merge_request']) && tgt == 'dev' && mra == 'merged')
+}
+
+pipeline {
+  agent any
+
+  environment {
+    REGISTRY      = 'docker.io/kindorca'
+    BE_IMAGE      = 'baekseol-backend'
+    FE_IMAGE      = 'baekseol-frontend'
+    DOCKER_CREDS  = 'dockerhub-creds'
+    HOST_JENKINS_HOME = '/home/ubuntu/jenkins-data'
+    DEPLOY_USER   = 'ubuntu'
+    DEPLOY_HOST   = '52.78.204.119'
+    SSH_CREDS     = 'ssh_key'
+    TAG           = "${env.BUILD_NUMBER}"
+    VITE_API_BASE_URL       = 'http://www.baekseol.site/api/v1'
+    VITE_TOSS_CLIENT_KEY    = credentials('toss-client-key')
+    VITE_TOSS_CUSTOMER_KEY  = credentials('toss-customer-key')
+  }
+
+  options {
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    timestamps()
+    skipDefaultCheckout(true)
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        script {
+          if (env.gitlabSourceBranch) {
+            echo "MR detected → checkout origin/${env.gitlabSourceBranch}"
+            checkout([
+              $class: 'GitSCM',
+              branches: [[name: "origin/${env.gitlabSourceBranch}"]],
+              userRemoteConfigs: scm.userRemoteConfigs
+            ])
+          } else {
+            echo "Normal push → checkout default SCM branch"
+            checkout(scm)
+          }
+        }
+      }
+    }
+
+    // ============ CI ============
+    stage('CI - Backend Test (JDK21)') {
+      when { expression { isMrToDevOpenOrUpdated() } }
+      steps {
+        script {
+          echo "Backend Test (Gradle JDK21)"
+          def job    = (env.JOB_NAME ?: "").replaceAll('%2F','/')
+          def hostWs = "${HOST_JENKINS_HOME}/workspace/${job}"
+
+          sh """
+            docker run --rm \
+              -v "${hostWs}/Backend":/w \
+              -w /w \
+              gradle:8.10.2-jdk21 \
+              bash -lc 'set -euxo pipefail; ./gradlew clean test -Dspring.profiles.active=test --no-daemon'
+          """
+        }
+      }
+    }
+
+    stage('CI - Frontend Build') {
+      when { expression { isMrToDevOpenOrUpdated() } }
+      steps {
+        script {
+          echo "Frontend Build"
+          def job    = (env.JOB_NAME ?: "").replaceAll('%2F','/')
+          def hostWs = "${HOST_JENKINS_HOME}/workspace/${job}"
+
+          sh """
+            docker run --rm \
+              -v "${hostWs}/Frontend":/w \
+              -w /w \
+              node:20-bullseye \
+              bash -lc 'set -euxo pipefail; ls -la; npm ci; npm run build'
+          """
+        }
+      }
+    }
+
+    // ============ CD ============
+    stage('CD - Build Backend JAR') {
+      when { expression { isDevDeployTrigger() } }
+      steps {
+        script {
+          def job    = (env.JOB_NAME ?: "").replaceAll('%2F','/')
+          def hostWs = "${HOST_JENKINS_HOME}/workspace/${job}"
+
+          sh """
+            docker run --rm \
+              -v "${hostWs}/Backend":/w \
+              -w /w \
+              gradle:8.10.2-jdk21 \
+              bash -lc 'set -euxo pipefail; ./gradlew clean build -x test --no-daemon'
+          """
+        }
+        dir('Backend') {
+          archiveArtifacts artifacts: 'build/libs/*.jar', fingerprint: true
+        }
+      }
+    }
+
+    stage('CD - Docker Build & Push (BE/FE)') {
+      when { expression { isDevDeployTrigger() } }
+      steps {
+       script {
+          docker.withRegistry('https://index.docker.io/v1/', DOCKER_CREDS) {
+            sh '''
+              set -euxo pipefail
+
+              docker build -t ${REGISTRY}/${BE_IMAGE}:${TAG} -t ${REGISTRY}/${BE_IMAGE}:dev-latest Backend
+              docker push  ${REGISTRY}/${BE_IMAGE}:${TAG}
+              docker push  ${REGISTRY}/${BE_IMAGE}:dev-latest
+
+              docker build \
+                --build-arg VITE_API_BASE_URL="$VITE_API_BASE_URL" \
+                --build-arg VITE_TOSS_CLIENT_KEY="$VITE_TOSS_CLIENT_KEY" \
+                --build-arg VITE_TOSS_CUSTOMER_KEY="$VITE_TOSS_CUSTOMER_KEY" \
+                -t ${REGISTRY}/${FE_IMAGE}:${TAG} \
+                -t ${REGISTRY}/${FE_IMAGE}:dev-latest \
+                Frontend
+              docker push  ${REGISTRY}/${FE_IMAGE}:${TAG}
+              docker push  ${REGISTRY}/${FE_IMAGE}:dev-latest
+            '''
+          }
+        }
+      }
+    }
+
+    stage('CD - Deploy (docker compose up)') {
+      when { expression { isDevDeployTrigger() } }
+      steps {
+        sshagent(credentials: [env.SSH_CREDS]) {
+          sh """
+            set -euxo pipefail
+            ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
+              set -euxo pipefail
+              cd /home/ubuntu/infra
+              docker compose -f app.compose.yml pull
+              docker compose -f app.compose.yml up -d --remove-orphans
+              docker image prune -f
+            '
+          """
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "Build #${env.BUILD_NUMBER} → ${currentBuild.currentResult}"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    }
+    success {
+      script {
+        if (isMrToDevOpenOrUpdated()) {
+          echo "CI Passed — MR is ready to merge (target: dev)"
+        }
+        if (isDevDeployTrigger()) {
+          echo "CD Completed — Deployed to ${DEPLOY_HOST}"
+        }
+      }
+    }
+  }
+}
