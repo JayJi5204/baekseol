@@ -44,9 +44,9 @@
 #### Spring Boot 설정(.env)
 
 ```bash
-MYSQL_USER=root
-MYSQL_PASSWORD=ssafy
-SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3306/test?rewriteBatchedStatements=true&serverTimezone=Asia/Seoul
+MYSQL_USER=""
+MYSQL_PASSWORD=""
+SPRING_DATASOURCE_URL=""
 
 # JWT
 JWT_SECRET=""
